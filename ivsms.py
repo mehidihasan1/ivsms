@@ -7,92 +7,111 @@ import urllib.parse
 from datetime import datetime
 
 # --- Configuration ---
-# Replace with your actual Telegram Bot Token and Chat ID
+# You MUST replace these placeholders with your actual values.
+
+# Telegram Bot API Token and Chat ID
 TELEGRAM_BOT_TOKEN = "8106314263:AAE5hF1a0DHcRJGS2DSqcuWTDpttakZUT4Q"  # Replace with your bot's token
 TELEGRAM_CHAT_ID = "-1002805004101"       # Replace with your group's chat ID (e.g., -123456789)
 
-# --- IVA SMS URLs ---
+# IVA SMS Portal Credentials
+# IMPORTANT: For production, consider using environment variables or a secure
+# configuration management system instead of hardcoding sensitive data.
+YOUR_EMAIL = "mehidiha94@gmail.com"  # Replace with your actual IVA SMS email
+YOUR_PASSWORD = "Xd62924826"      # Replace with your actual IVA SMS password
+
+# --- Dynamic Target Number Selection Configuration ---
+# Configure ONE of these options (set the other to None).
+
+# OPTION 1: Select a number by its index in the dynamically loaded dropdown list.
+# (0 for the first usable number, 1 for the second, etc.)
+# This is useful if the order of your numbers is consistent and you always want a specific position.
+# Set to None if you prefer to use OPTION 2 (specific number string).
+CONFIGURED_TARGET_NUMBER_INDEX = 0  # <--- Set your desired index (e.g., 0, 1, 2...), or None
+
+# OPTION 2: Select a specific phone number string from the dynamically loaded list.
+# The script will search for this exact number. This is generally more reliable
+# if the order of numbers can change, but the number itself remains constant.
+# Set to None if you strictly want to use OPTION 1 (index-based selection).
+CONFIGURED_SPECIFIC_NUMBER = "2250150830396" # <--- Set your desired specific number string, or None
+
+# If both are None, the script will default to the very first available number found.
+# If both are set, CONFIGURED_TARGET_NUMBER_INDEX will take precedence if it's a valid index.
+
+
+# --- IVA SMS Portal URLs (Generally don't need to be changed) ---
 LOGIN_URL = "https://www.ivasms.com/login"
 SMS_RECEIVED_PAGE_URL = "https://www.ivasms.com/portal/sms/received"
 SMS_DATA_ENDPOINT = "https://www.ivasms.com/portal/sms/received/getsms/number/sms"
 
-# --- Your IVA SMS Credentials ---
-# IMPORTANT: For production, use environment variables or a secure configuration method
-# instead of hardcoding sensitive information directly in the script.
-YOUR_EMAIL = "mehidiha94@gmail.com"  # Replace with your actual IVA SMS email
-YOUR_PASSWORD = "Xd62924826"      # Replace with your actual IVA SMS password
 
-# --- SMS Parameters to Query For ---
-# This is the specific number you want to monitor.
-# The script will try to find its corresponding 'Range' dynamically.
-TARGET_NUMBER = "2250150830396" # <--- REPLACE THIS with your desired monitoring number
-
-# Global session object for persistent cookies across requests
+# Global session object for persistent cookies across requests.
+# This automatically handles session cookies received after login.
 session = requests.Session()
 
-# Global variables to store dynamically retrieved values
-DYNAMIC_CSRF_TOKEN = ""
-AVAILABLE_NUMBERS = {}  # To store number -> range mapping parsed from the portal
-SELECTED_NUMBER_TO_QUERY = TARGET_NUMBER # This will be the number actually used in the query
-SELECTED_RANGE_TO_QUERY = "" # This will be the range dynamically found for SELECTED_NUMBER_TO_QUERY
+# Global variables to store dynamically retrieved data
+DYNAMIC_CSRF_TOKEN = "" # CSRF token for making POST requests
+AVAILABLE_NUMBERS_LIST = [] # A list of dictionaries: [{"number": "...", "range": "..."}, ...]
+SELECTED_NUMBER_TO_QUERY = None # The phone number chosen for the current query
+SELECTED_RANGE_TO_QUERY = "" # The range associated with the chosen phone number
 
 
 def get_csrf_token(html_content):
     """
-    Extracts the CSRF token from the HTML content.
-    Looks for a meta tag with name 'csrf-token' or a hidden input field named '_token'.
+    Extracts the CSRF token from the provided HTML content.
+    Looks for a meta tag with 'csrf-token' name or a hidden input named '_token'.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # Try finding in meta tag first (common in Laravel)
+    # Attempt to find CSRF token in a meta tag (common in Laravel applications)
     csrf_meta = soup.find('meta', {'name': 'csrf-token'})
     if csrf_meta and 'content' in csrf_meta.attrs:
         print("🔗 Found CSRF Token in meta tag.")
         return csrf_meta['content']
 
-    # If not found in meta, try finding in hidden input field (also common in forms)
+    # If not found in meta tag, attempt to find in a hidden input field
     csrf_input = soup.find('input', {'name': '_token'})
     if csrf_input and 'value' in csrf_input.attrs:
         print("🔗 Found CSRF Token in hidden input.")
         return csrf_input['value']
 
-    print("⚠️ Warning: Could not find CSRF token in HTML content. This might cause issues.")
+    print("⚠️ Warning: Could not find CSRF token in HTML content. This might indicate a change in website structure or missing data.")
     return None
 
 def send_telegram_message(chat_id, message_text):
     """
-    Sends a message to the specified Telegram chat ID, supporting HTML parse mode
-    and splitting long messages into chunks.
+    Sends a message to the specified Telegram chat ID.
+    Supports HTML formatting and automatically splits messages longer than 4096 characters.
     """
     telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    MAX_MESSAGE_LENGTH = 4096 # Telegram's message character limit
+    MAX_MESSAGE_LENGTH = 4096 # Telegram's per-message character limit
     
     chunks = []
     current_chunk = ""
     
-    # Attempt to split message into chunks, prioritizing breaking at natural SMS entry boundaries
+    # Prioritize splitting messages at logical separators (e.g., between SMS entries)
+    # This makes multi-part messages more readable.
     if "➖➖➖➖➖➖➖➖➖➖" in message_text:
         raw_entries = message_text.split("➖➖➖➖➖➖➖➖➖➖")
         for i, entry in enumerate(raw_entries):
             entry_to_add = entry.strip()
-            if i > 0: # Add separator back for subsequent entries if they are not the first
+            if i > 0: # Add the separator back for subsequent entries
                 entry_to_add = "\n\n➖➖➖➖➖➖➖➖➖➖\n\n" + entry_to_add
 
             if len(current_chunk) + len(entry_to_add) > MAX_MESSAGE_LENGTH:
-                if current_chunk: # Add current chunk if not empty
+                if current_chunk: # Add the current accumulation as a chunk if not empty
                     chunks.append(current_chunk.strip())
-                current_chunk = entry_to_add # Start new chunk with this entry
+                current_chunk = entry_to_add # Start a new chunk with this entry
             else:
-                if current_chunk:
+                if current_chunk: # Append to current chunk
                     current_chunk += entry_to_add
-                else:
-                    current_chunk = entry_to_add # For the very first entry
-        if current_chunk: # Add the very last chunk
+                else: # Start first chunk
+                    current_chunk = entry_to_add
+        if current_chunk: # Add any remaining text as the last chunk
             chunks.append(current_chunk.strip())
-    else: # Fallback to splitting by lines if no specific separator or short message
+    else: # Fallback to splitting by lines if no specific separator or message is short
         lines = message_text.split('\n')
         for line in lines:
-            if len(current_chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH: # +1 for newline
+            if len(current_chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH: # +1 for newline character
                 if current_chunk:
                     chunks.append(current_chunk.strip())
                 current_chunk = line.strip()
@@ -109,29 +128,27 @@ def send_telegram_message(chat_id, message_text):
         payload = {
             "chat_id": chat_id,
             "text": chunk,
-            "parse_mode": "HTML", # Use HTML for formatting (bold, italics, code)
-            "disable_web_page_preview": True # Prevents Telegram from creating link previews for URLs
+            "parse_mode": "HTML", # Enable HTML formatting (<b>, <i>, <code>, etc.)
+            "disable_web_page_preview": True # Prevent Telegram from creating unwanted link previews
         }
         try:
             response = requests.post(telegram_api_url, json=payload, timeout=10)
-            response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
-            time.sleep(0.5) # Short delay to adhere to Telegram API rate limits (approx 30 messages/sec for user bots)
+            response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+            time.sleep(0.5) # Pause briefly to respect Telegram API rate limits
         except requests.exceptions.RequestException as e:
             print(f"❌ Error sending message part {i+1} to Telegram: {e}")
-            # If sending fails, we might want to stop trying subsequent parts
+            # Send a critical error to Telegram and stop sending remaining chunks
             send_telegram_message(chat_id, f"<b>⚠️ Critical Error:</b> Failed to send further messages to Telegram. Check bot token/chat ID or API limits. Details: <code>{e}</code>")
-            break # Stop trying to send remaining chunks if first one fails
+            break
 
 
 def perform_login():
     """
-    Handles the entire login process to IVA SMS portal.
-    1. Fetches the login page to get initial CSRF token and cookies.
-    2. Submits login credentials with the obtained token.
-    3. Returns True if login appears successful (redirects to portal), False otherwise.
+    Handles the entire login process for the IVA SMS portal.
+    1. Fetches the login page to acquire an initial CSRF token and session cookies.
+    2. Submits login credentials along with the obtained token.
+    3. Returns True if login appears successful (indicated by redirection to a portal/dashboard URL), False otherwise.
     """
-    global DYNAMIC_CSRF_TOKEN # We'll need to set this after login
-
     print("🔑 Initiating login process...")
     send_telegram_message(TELEGRAM_CHAT_ID, "<i>Attempting to log in to IVA SMS portal...</i> 🔄")
 
@@ -139,14 +156,14 @@ def perform_login():
     print(f"🌐 Fetching login page: {LOGIN_URL}")
     try:
         response = session.get(LOGIN_URL, timeout=15)
-        response.raise_for_status()
+        response.raise_for_status() # Check for HTTP errors (e.g., 404, 500)
         initial_login_csrf_token = get_csrf_token(response.text)
         if not initial_login_csrf_token:
             print("❌ Failed to get initial CSRF token from login page.")
             send_telegram_message(TELEGRAM_CHAT_ID, "<b>❌ Login Failed:</b> Could not retrieve initial CSRF token from login page. Website structure might have changed.")
             return False
 
-        print(f"🍪 Initial cookies acquired for login: {session.cookies.get_dict()}")
+        print(f"🍪 Initial cookies acquired during login page fetch: {session.cookies.get_dict()}")
 
     except requests.exceptions.RequestException as e:
         print(f"❌ Error fetching login page: {e}")
@@ -154,43 +171,49 @@ def perform_login():
         return False
 
     # Step 2: Prepare and send POST data for login
-    # WARNING: The 'g-recaptcha-response' field is a major hurdle for automation.
-    # A real reCAPTCHA token needs to be obtained by solving a CAPTCHA (manually or via a service).
-    # The current placeholder will cause login to FAIL unless the site has no active reCAPTCHA.
+    # IMPORTANT RECAPTCHA NOTE:
+    # The 'g-recaptcha-response' field is a significant challenge for automation.
+    # A valid reCAPTCHA token is typically obtained by a user solving a CAPTCHA in a browser,
+    # or via integration with a specialized CAPTCHA-solving service.
+    # The placeholder "MANUAL_OR_SOLVED_RECAPTCHA_TOKEN" will cause login to FAIL for real
+    # reCAPTCHA-protected sites unless replaced with a live, valid token.
     login_data = {
         "_token": initial_login_csrf_token,
         "email": YOUR_EMAIL,
         "password": YOUR_PASSWORD,
         "remember": "on",
-        "g-recaptcha-response": "MANUAL_OR_SOLVED_RECAPTCHA_TOKEN", # <--- CRITICAL: THIS MUST BE A VALID, SOLVED TOKEN
-        "submit": "register" # This is likely the name of the submit button in the form
+        "g-recaptcha-response": "MANUAL_OR_SOLVED_RECAPTCHA_TOKEN", # <--- CRITICAL: THIS MUST BE A VALID, SOLVED TOKEN!
+        "submit": "register" # This parameter is often the 'name' attribute of the submit button
     }
 
+    # Headers for the login POST request (mimicking a browser)
     login_headers = {
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "accept-language": "en-US,en;q=0.9",
         "cache-control": "max-age=0",
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://www.ivasms.com",
-        "referer": LOGIN_URL,
+        "referer": LOGIN_URL, # Referer header should point to the page the request originated from
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-        "priority": "u=0, i" # Keep as provided in curl, might be important for some sites
+        "priority": "u=0, i" # Some sites use this for prioritization
     }
 
     print("➡️ Sending login credentials...")
     try:
+        # Use allow_redirects=True to follow login redirects to the final portal page
         login_response = session.post(LOGIN_URL, headers=login_headers, data=login_data, allow_redirects=True, timeout=20)
-        login_response.raise_for_status()
+        login_response.raise_for_status() # Raise HTTPError for bad responses (e.g., 401 Unauthorized)
 
-        # Check if login was successful by examining the final URL after redirects
+        # Check the final URL after redirects to confirm successful login.
+        # Successful logins usually redirect to a dashboard or portal page.
         if "/portal" in login_response.url or "/dashboard" in login_response.url:
-            print(f"✅ Login successful! Redirected to: {login_response.url}")
-            send_telegram_message(TELEGRAM_CHAT_ID, "<b>✅ Login Successful!</b> Fetching SMS data now... 🚀")
-            # The 'session' object now automatically holds the authenticated cookies.
+            print(f"✅ Login successful! Final URL after redirection: {login_response.url}")
+            send_telegram_message(TELEGRAM_CHAT_ID, "<b>✅ Login Successful!</b> Proceeding to fetch SMS data... 🚀")
+            # The 'session' object now automatically holds the authenticated cookies for subsequent requests.
             return True
         else:
-            print(f"❌ Login failed. Not redirected to portal. Final URL: {login_response.url}")
-            print(f"Response content snippet: {login_response.text[:1000]}...")
+            print(f"❌ Login failed. Not redirected to expected portal URL. Final URL: {login_response.url}")
+            print(f"Response content snippet (first 1000 chars): {login_response.text[:1000]}...")
             send_telegram_message(TELEGRAM_CHAT_ID, "<b>❌ Login Failed:</b> Incorrect credentials, reCAPTCHA not solved, or unexpected redirect. Please check manually.")
             return False
 
@@ -201,10 +224,13 @@ def perform_login():
 
 def get_dynamic_sms_params():
     """
-    After successful login, fetches the /portal/sms/received page to extract
-    the CSRF token needed for the SMS data query and available numbers/ranges from dropdowns.
+    After successful login, this function fetches the SMS received page to:
+    1. Extract the current CSRF token needed for AJAX SMS data queries.
+    2. Populate the list of available phone numbers and their associated ranges
+       from the HTML dropdowns on the page.
+    3. Selects the target phone number and its range based on the script's configuration.
     """
-    global DYNAMIC_CSRF_TOKEN, AVAILABLE_NUMBERS, SELECTED_NUMBER_TO_QUERY, SELECTED_RANGE_TO_QUERY
+    global DYNAMIC_CSRF_TOKEN, AVAILABLE_NUMBERS_LIST, SELECTED_NUMBER_TO_QUERY, SELECTED_RANGE_TO_QUERY
 
     print(f"✨ Fetching SMS received page to get dynamic parameters: {SMS_RECEIVED_PAGE_URL}")
     send_telegram_message(TELEGRAM_CHAT_ID, "<i>Retrieving dynamic SMS query parameters...</i> 🔍")
@@ -216,63 +242,91 @@ def get_dynamic_sms_params():
         soup = BeautifulSoup(response.text, 'html.parser')
 
         # 1. Extract CSRF Token for the SMS data request form
-        # This token is crucial for the POST request to getsms/number/sms
+        # This token is crucial for the POST request to getsms/number/sms.
+        # It might be different from the login CSRF token.
         current_csrf_token = get_csrf_token(response.text)
         if current_csrf_token:
             DYNAMIC_CSRF_TOKEN = current_csrf_token
             print(f"🔑 Updated CSRF Token for SMS data request: {DYNAMIC_CSRF_TOKEN}")
         else:
-            print("⚠️ Warning: Could not get a new CSRF token from SMS received page. This might indicate an issue or a different token management.")
+            print("⚠️ Warning: Could not get a new CSRF token from SMS received page. This might indicate an issue with page structure.")
             send_telegram_message(TELEGRAM_CHAT_ID, "<b>⚠️ Warning:</b> Could not find dynamic token for SMS query. Might fail.")
         
         # 2. Extract available numbers and their associated ranges from dropdowns
-        # You need to carefully inspect the HTML of the 'sms/received' page for the SELECT element
-        # that corresponds to the phone number selection.
-        # Look for attributes like 'name' or 'id'. Common names are 'Number', 'msisdn', 'phone_number'.
+        # You MUST inspect your ivasms.com portal's HTML for the <select> element
+        # that corresponds to the phone number selection. Look for its 'name' or 'id'.
         
-        # Example: Assuming the select tag has name="Number"
-        number_select = soup.find('select', {'name': 'Number'})
+        # Common name for number dropdown is 'Number'. Adjust if different.
+        number_select = soup.find('select', {'name': 'Number'}) 
         if number_select:
             print("🔢 Found 'Number' selection element. Parsing options...")
+            # Clear previous list for a fresh run
+            AVAILABLE_NUMBERS_LIST.clear() 
             for option in number_select.find_all('option'):
                 number_value = option.get('value')
                 number_text = option.get_text(strip=True)
                 
-                if number_value and number_text:
-                    # The 'Range' value is often embedded in the option's text like "Number (Range)"
+                # Filter out empty or placeholder options like "Select a Number"
+                if number_value and number_text and number_value != '':
+                    # The 'Range' value is typically embedded in the option's text like "Number (Range)"
                     # Adjust this regex to perfectly match how your 'Range' appears in the dropdown text.
-                    # e.g., "2250150830396 (IVORY COAST 9662)" -> Extracts "IVORY COAST 9662"
+                    # Example format: "2250150830396 (IVORY COAST 9662)" -> Extracts "IVORY COAST 9662"
                     match = re.search(r'\((.*?)\)', number_text)
                     range_from_text = match.group(1).strip() if match else "Unknown Range"
                     
-                    AVAILABLE_NUMBERS[number_value] = range_from_text
+                    AVAILABLE_NUMBERS_LIST.append({"number": number_value, "range": range_from_text})
                     print(f"  - Discovered Number: {number_value}, Range: {range_from_text}")
             
-            if AVAILABLE_NUMBERS:
-                # Prioritize using the pre-configured TARGET_NUMBER
-                if TARGET_NUMBER in AVAILABLE_NUMBERS:
-                    SELECTED_NUMBER_TO_QUERY = TARGET_NUMBER
-                    SELECTED_RANGE_TO_QUERY = AVAILABLE_NUMBERS[TARGET_NUMBER]
-                    print(f"🎯 Successfully matched configured target number: {SELECTED_NUMBER_TO_QUERY} (Range: {SELECTED_RANGE_TO_QUERY})")
-                    send_telegram_message(TELEGRAM_CHAT_ID, f"<i>Parameters found! Target Number: </i><code>{SELECTED_NUMBER_TO_QUERY}</code> <i>(Range: {SELECTED_RANGE_TO_QUERY})</i>")
-                else:
-                    # If TARGET_NUMBER is not found among available options, use the first one available
-                    first_available_number = list(AVAILABLE_NUMBERS.keys())[0]
-                    first_available_range = AVAILABLE_NUMBERS[first_available_number]
-                    SELECTED_NUMBER_TO_QUERY = first_available_number
-                    SELECTED_RANGE_TO_QUERY = first_available_range
-                    print(f"⚠️ Configured target number {TARGET_NUMBER} not found among available options. Using first available: {SELECTED_NUMBER_TO_QUERY} ({SELECTED_RANGE_TO_QUERY})")
-                    send_telegram_message(TELEGRAM_CHAT_ID, f"<b>⚠️ Warning:</b> Configured target number <code>{TARGET_NUMBER}</code> not found in portal options. Using first available: <code>{SELECTED_NUMBER_TO_QUERY}</code> <i>(Range: {SELECTED_RANGE_TO_QUERY})</i>")
-            else:
-                print("⛔ No numbers found in the dropdown on the SMS received page. Cannot proceed dynamically.")
+            # 3. Select the target number based on the configuration (INDEX or SPECIFIC_NUMBER)
+            if not AVAILABLE_NUMBERS_LIST:
+                print("⛔ No usable numbers found in the dropdown on the SMS received page. Cannot proceed dynamically.")
                 send_telegram_message(TELEGRAM_CHAT_ID, "<b>⛔ Error:</b> No phone numbers found on the SMS received page. Please check portal access.")
-                return False # Cannot proceed without a number
+                return False # Cannot proceed without available numbers
+
+            selected_successfully = False
+
+            # Priority 1: Select by index if configured and valid
+            if CONFIGURED_TARGET_NUMBER_INDEX is not None:
+                if 0 <= CONFIGURED_TARGET_NUMBER_INDEX < len(AVAILABLE_NUMBERS_LIST):
+                    selected_item = AVAILABLE_NUMBERS_LIST[CONFIGURED_TARGET_NUMBER_INDEX]
+                    SELECTED_NUMBER_TO_QUERY = selected_item['number']
+                    SELECTED_RANGE_TO_QUERY = selected_item['range']
+                    selected_successfully = True
+                    print(f"🎯 Selected number by index {CONFIGURED_TARGET_NUMBER_INDEX}: {SELECTED_NUMBER_TO_QUERY} ({SELECTED_RANGE_TO_QUERY})")
+                    send_telegram_message(TELEGRAM_CHAT_ID, f"<i>Parameters found! Querying number at index {CONFIGURED_TARGET_NUMBER_INDEX}:</i> <code>{SELECTED_NUMBER_TO_QUERY}</code> <i>(Range: {SELECTED_RANGE_TO_QUERY})</i>")
+                else:
+                    print(f"⚠️ Configured index {CONFIGURED_TARGET_NUMBER_INDEX} is out of bounds ({len(AVAILABLE_NUMBERS_LIST)} available numbers).")
+                    send_telegram_message(TELEGRAM_CHAT_ID, f"<b>⚠️ Warning:</b> Configured index out of bounds. Trying specific number or first available.")
+            
+            # Priority 2: Select by specific number string if configured and not already selected by index
+            if not selected_successfully and CONFIGURED_SPECIFIC_NUMBER is not None:
+                for item in AVAILABLE_NUMBERS_LIST:
+                    if item['number'] == CONFIGURED_SPECIFIC_NUMBER:
+                        SELECTED_NUMBER_TO_QUERY = CONFIGURED_SPECIFIC_NUMBER
+                        SELECTED_RANGE_TO_QUERY = item['range']
+                        selected_successfully = True
+                        print(f"🎯 Selected configured specific number: {SELECTED_NUMBER_TO_QUERY} ({SELECTED_RANGE_TO_QUERY})")
+                        send_telegram_message(TELEGRAM_CHAT_ID, f"<i>Parameters found! Querying specific number:</i> <code>{SELECTED_NUMBER_TO_QUERY}</code> <i>(Range: {SELECTED_RANGE_TO_QUERY})</i>")
+                        break
+                if not selected_successfully:
+                    print(f"⚠️ Configured specific number {CONFIGURED_SPECIFIC_NUMBER} not found in the available list.")
+                    send_telegram_message(TELEGRAM_CHAT_ID, f"<b>⚠️ Warning:</b> Configured specific number <code>{CONFIGURED_SPECIFIC_NUMBER}</code> not found.")
+            
+            # Final Fallback: If neither index nor specific number worked or was configured, use the first available
+            if not selected_successfully:
+                SELECTED_NUMBER_TO_QUERY = AVAILABLE_NUMBERS_LIST[0]['number']
+                SELECTED_RANGE_TO_QUERY = AVAILABLE_NUMBERS_LIST[0]['range']
+                print(f"🎯 Falling back to first available number: {SELECTED_NUMBER_TO_QUERY} ({SELECTED_RANGE_TO_QUERY})")
+                send_telegram_message(TELEGRAM_CHAT_ID, f"<i>Parameters found! Falling back to first available:</i> <code>{SELECTED_NUMBER_TO_QUERY}</code> <i>(Range: {SELECTED_RANGE_TO_QUERY})</i>")
+                selected_successfully = True # Mark as successfully selected via fallback
+
+            return selected_successfully
+
         else:
-            print("⛔ Could not find the 'Number' select element on the page. Website structure might have changed.")
+            print("⛔ Could not find the 'Number' select element on the page. Website structure might have changed (e.g., 'name' attribute changed).")
             send_telegram_message(TELEGRAM_CHAT_ID, "<b>⛔ Error:</b> The 'Number' selection element was not found on the page. Portal structure may have changed.")
             return False # Cannot proceed if the select element isn't found
 
-        return True
     except requests.exceptions.RequestException as e:
         print(f"❌ Error fetching SMS received page for dynamic params: {e}")
         send_telegram_message(TELEGRAM_CHAT_ID, f"<b>❌ Error:</b> Network error fetching SMS received page: <code>{e}</code>")
@@ -288,9 +342,15 @@ def get_ivasms_data():
     and dynamically obtained parameters (CSRF token, selected number/range).
     Returns the raw HTML response from the data endpoint, or None if the request fails.
     """
+    # Ensure a number and range have been successfully selected before attempting to fetch
+    if not SELECTED_NUMBER_TO_QUERY or not SELECTED_RANGE_TO_QUERY:
+        print("❌ Cannot fetch SMS data: SELECTED_NUMBER_TO_QUERY or SELECTED_RANGE_TO_QUERY not set.")
+        send_telegram_message(TELEGRAM_CHAT_ID, "<b>❌ Data Fetch Error:</b> Target number/range not identified. Cannot proceed.")
+        return None
+
     print(f"📦 Attempting to fetch SMS data for Number: {SELECTED_NUMBER_TO_QUERY} ({SELECTED_RANGE_TO_QUERY})...")
     
-    # Headers for the actual SMS data request (from your initial curl)
+    # Headers for the actual SMS data request (mimicking the AJAX call)
     sms_data_headers = {
         "accept": "text/html, */*; q=0.01",
         "accept-language": "en-US,en;q=0.9",
@@ -304,30 +364,34 @@ def get_ivasms_data():
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-        "x-requested-with": "XMLHttpRequest", # Indicates an AJAX request
+        "x-requested-with": "XMLHttpRequest", # Crucial for indicating an AJAX request
     }
     
-    # Payload for the POST request
-    # You can specify a date range here if needed, e.g., for "today"
-    # today_date_str = datetime.now().strftime("%Y-%m-%d")
+    # Payload for the POST request to get SMS data
+    # 'start' and 'end' dates can be specified to filter results.
+    # Leaving them empty usually means "all data" or "recent data" as per site's default.
+    # Example to fetch today's data in Bangladesh timezone:
+    # from pytz import timezone
+    # import pytz
+    # current_date_bangladesh = datetime.now(pytz.timezone('Asia/Dhaka')).strftime("%Y-%m-%d")
     
     sms_data_payload = {
         "_token": DYNAMIC_CSRF_TOKEN,
-        "start": "", # Keep empty for all history, or set a date like "2025-07-01"
-        "end": "",   # Keep empty, or set a date like today_date_str
+        "start": "", # Set to a date string like "2025-07-01" to filter by start date
+        "end": "",   # Set to a date string like "2025-07-18" (today) to filter by end date
         "Number": SELECTED_NUMBER_TO_QUERY,
         "Range": SELECTED_RANGE_TO_QUERY,
     }
 
     try:
-        # Use the established session object for the POST request
+        # Use the established requests session object for the POST request
         response = session.post(
             SMS_DATA_ENDPOINT,
             headers=sms_data_headers,
             data=sms_data_payload,
-            timeout=20 # Extended timeout for data fetching
+            timeout=20 # Extended timeout for network robustness
         )
-        response.raise_for_status() # Check for HTTP errors (e.g., 404, 500)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
         print("✅ Successfully fetched SMS data HTML.")
         return response.text
     except requests.exceptions.RequestException as e:
@@ -338,115 +402,60 @@ def get_ivasms_data():
 def parse_sms_html(html_content):
     """
     Parses the HTML response from the SMS data endpoint to extract individual SMS details.
-    This part is HIGHLY dependent on the actual HTML structure of the SMS list on ivasms.com.
-    You MUST inspect the HTML returned by get_ivasms_data() and adjust the selectors accordingly.
+    This function is CRITICAL and HIGHLY dependent on the EXACT HTML structure of the SMS list
+    as returned by ivasms.com's '/getsms/number/sms' endpoint.
+    You MUST inspect the actual HTML response and adjust the selectors accordingly.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     messages = []
     
-    # --- CUSTOMIZE THIS PART BASED ON ACTUAL HTML STRUCTURE ---
-    # Common scenarios:
-    # 1. SMS messages are in rows of a <table> element.
-    #    Look for a table with a specific class or ID, then iterate through its <tbody> and <tr> elements.
-    # 2. SMS messages are in individual <div> or <p> elements with specific classes.
-    #    Use soup.find_all('div', class_='sms-message-container') for example.
+    # --- CUSTOMIZE THIS PART BASED ON YOUR INSPECTION OF THE ACTUAL HTML RESPONSE ---
+    # The most common scenario is that the response is an HTML table body (<tbody>)
+    # or a series of table rows (<tr>) that are injected into a table on the page.
+    # Sometimes it's a list of divs, e.g., <div class="sms-message-card">...</div>
 
-    # Example: Assuming the SMS data is returned as part of an HTML table's <tbody> or just raw <tr>s
-    # Try finding rows within a common table structure first.
-    sms_table = soup.find('table', class_='table') # Replace 'table' with actual class/ID if more specific
-    if sms_table:
-        rows_to_parse = sms_table.find('tbody').find_all('tr') if sms_table.find('tbody') else sms_table.find_all('tr')
-    else:
-        # Fallback: Maybe the response itself is just a set of <tr> elements, or divs
-        rows_to_parse = soup.find_all('tr') # Try finding any <tr> if not within a specific table
-        if not rows_to_parse:
-            # If not table rows, try finding specific divs that hold message info
-            # Example: rows_to_parse = soup.find_all('div', class_='sms-entry-card')
-            pass # Keep this generic for now, requires manual inspection
+    # Try to find table rows (<tr>) within the HTML. If the response is just a <tbody>,
+    # then `soup.find_all('tr')` will find the rows directly.
+    # If messages are inside a specific table (e.g., <table id="smsTable">),
+    # you might start with `sms_table = soup.find('table', id='smsTable')`
+    # then `rows_to_parse = sms_table.find_all('tr')` or `sms_table.find('tbody').find_all('tr')`.
+    
+    rows_to_parse = []
+    # Attempt 1: Find a specific table and its rows
+    # Example: If your SMS table has class 'data-table'
+    specific_table = soup.find('table', class_='table') 
+    if specific_table:
+        # Try to find tbody first, then fallback to direct tr if tbody not found
+        rows_to_parse = specific_table.find('tbody').find_all('tr') if specific_table.find('tbody') else specific_table.find_all('tr')
+    
+    # Attempt 2: If no specific table, assume the response itself is just list of <tr> elements
+    if not rows_to_parse:
+        rows_to_parse = soup.find_all('tr')
+
+    # Attempt 3: If still no rows, consider if messages are in divs (e.g., class='sms-message')
+    if not rows_to_parse:
+        # Example: messages_divs = soup.find_all('div', class_='sms-message-card')
+        # if messages_divs:
+        #     for msg_div in messages_divs:
+        #         sender = msg_div.find('span', class_='sender').get_text(strip=True)
+        #         content = msg_div.find('p', class_='content').get_text(strip=True)
+        #         time = msg_div.find('small', class_='timestamp').get_text(strip=True)
+        #         status = msg_div.find('span', class_='status').get_text(strip=True)
+        #         messages.append(f"📞 <b>From:</b> <code>{sender}</code>\n💬 <b>Message:</b> <i>{content}</i>\n⏰ <b>Time:</b> {time}\n📊 <b>Status:</b> {status}")
+        pass # Add your div-based parsing logic here if applicable
+
 
     if rows_to_parse:
         for row in rows_to_parse:
+            # Skip header rows often identified by <th> tags
+            if row.find('th'):
+                continue
+
             cols = row.find_all('td')
-            # Adjust column indices and what you extract based on actual data columns
-            # Example: Assuming columns are: Sender, Message, Date/Time, Status
-            if len(cols) >= 4:
+            # Adjust column indices (e.g., cols[0], cols[1], etc.) based on your table's structure.
+            # You might have different numbers of columns or different data in each.
+            if len(cols) >= 4: # Assuming at least 4 columns: Sender, Message, Date/Time, Status
                 sender = cols[0].get_text(strip=True) if cols[0] else "N/A"
                 message_content = cols[1].get_text(strip=True) if cols[1] else "N/A"
                 date_time = cols[2].get_text(strip=True) if cols[2] else "N/A"
-                status = cols[3].get_text(strip=True) if cols[3] else "N/A"
-                
-                # Make the output attractive with emojis and HTML formatting
-                messages.append(
-                    f"📞 <b>From:</b> <code>{sender}</code>\n"
-                    f"💬 <b>Message:</b> <i>{message_content}</i>\n"
-                    f"⏰ <b>Time:</b> {date_time}\n"
-                    f"📊 <b>Status:</b> {status}"
-                )
-            else:
-                # If a row has an unexpected number of columns or is a header/footer row, handle it gracefully
-                row_text = row.get_text(separator=' | ', strip=True)
-                if row_text and "No Data Found" not in row_text and "Loading" not in row_text: # Filter out common empty/loading messages
-                     # Only add if it's not a known non-data row
-                    messages.append(f"ℹ️ <i>Unstructured row (possible metadata):</i> {row_text}")
-    
-    if not messages:
-        # Fallback if no structured messages were parsed or no data found
-        print("⚠️ No structured SMS data found or could not parse. Providing raw HTML snippet.")
-        all_text = soup.get_text(separator='\n', strip=True)
-        # Check for specific "No Data" messages in the raw text
-        if "No Data Found" in all_text or "No matching records found" in all_text:
-            return f"<b>✨ No new SMS messages found for</b> <code>{SELECTED_NUMBER_TO_QUERY}</code> <i>({SELECTED_RANGE_TO_QUERY})</i> 😔"
-        
-        # If it's not explicitly "No Data", but still unparsed
-        if len(all_text) > 1500:
-            return (f"<b>⚠️ Could not parse detailed SMS for</b> <code>{SELECTED_NUMBER_TO_QUERY}</code>.\n\n"
-                    f"<i>Here's a raw snippet of the response (first 1500 chars). "
-                    f"You may need to update <code>parse_sms_html</code>:</i>\n"
-                    f"<code>{all_text[:1500]}...</code>")
-        else:
-            return (f"<b>⚠️ Could not parse detailed SMS for</b> <code>{SELECTED_NUMBER_TO_QUERY}</code>.\n\n"
-                    f"<i>Here's the full raw response. "
-                    f"You may need to update <code>parse_sms_html</code>:</i>\n"
-                    f"<code>{all_text}</code>")
-    else:
-        # Join parsed messages with an attractive separator
-        return "\n\n➖➖➖➖➖➖➖➖➖➖\n\n".join(messages)
-
-def main():
-    print(f"🚀 IVA SMS Telegram Bot starting at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}...")
-    send_telegram_message(TELEGRAM_CHAT_ID, "🤖 *IVA SMS Bot Initiated!*") # Initial bot start message
-
-    # Step 1: Perform Login
-    if not perform_login():
-        print("🛑 Login failed. Bot cannot proceed without successful authentication.")
-        send_telegram_message(TELEGRAM_CHAT_ID, "<b>🛑 Bot Halted:</b> Login to IVA SMS portal failed. Please resolve the issue (e.g., reCAPTCHA, credentials).")
-        return
-
-    # Step 2: Get Dynamic SMS Query Parameters (CSRF token, available numbers/ranges)
-    if not get_dynamic_sms_params():
-        print("🛑 Failed to get dynamic SMS parameters. Bot cannot proceed with data fetching.")
-        send_telegram_message(TELEGRAM_CHAT_ID, "<b>🛑 Bot Halted:</b> Failed to retrieve dynamic SMS parameters from the portal. This is crucial for querying.")
-        return
-
-    # Step 3: Fetch SMS Data
-    sms_html_data = get_ivasms_data()
-
-    if sms_html_data:
-        # Step 4: Parse HTML and format for Telegram
-        formatted_messages = parse_sms_html(sms_html_data)
-        final_telegram_message = (
-            f"🌟 <b>Latest SMS Data for</b> <code>{SELECTED_NUMBER_TO_QUERY}</code> "
-            f"<i>({SELECTED_RANGE_TO_QUERY})</i> 🌟\n\n"
-            f"{formatted_messages}"
-        )
-        send_telegram_message(TELEGRAM_CHAT_ID, final_telegram_message)
-        print("🎉 SMS data successfully fetched and sent to Telegram.")
-    else:
-        # Error message already sent by get_ivasms_data()
-        print("❌ Failed to retrieve SMS data. See Telegram for details or check logs.")
-
-    print(f"✅ Bot run completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    send_telegram_message(TELEGRAM_CHAT_ID, "😴 *IVA SMS Bot Finished Current Run.*")
-
-if __name__ == "__main__":
-    main()
+                status = cols[3].get_text(strip=True) if cols
